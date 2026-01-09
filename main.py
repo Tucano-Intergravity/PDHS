@@ -6,6 +6,7 @@ import threading
 import time
 import struct
 import binascii
+import traceback
 
 # --- Constants & Configuration ---
 
@@ -563,12 +564,54 @@ class App:
             status_tag = ""
             user_data = frame[22:] 
             user_data_len = len(user_data)
-
+            
             if svc == SVC_CONN and sub == MSG_PING_REP: msg_name = "PONG (Ping Reply)"
-            elif svc == SVC_STATUS and sub == MSG_REP_STATUS: msg_name = "STATUS REPLY"
+            elif svc == SVC_STATUS and sub == MSG_REP_STATUS:
+                msg_name = "STATUS REPLY"
+                
+                # 데이터가 8바이트 이상이면 구조체(8바이트)만 사용하여 디코딩 (뒤에 붙은 CRC 2바이트 등은 무시)
+                if len(user_data) >= 8:
+                    try:
+                        # PayloadStatus_t Parsing (First 8 bytes only)
+                        # UInt8(Status), UInt8(Res), SInt16(Temp), UInt8(IMU), UInt8(GPS), UInt8(Trk), UInt8(Res)
+                        # unpack format '<BxhBBBx' consumes 8 bytes but returns 5 values (x is ignored)
+                        p_stat, b_temp_raw, imu_st, gps_st, trk_st = struct.unpack('<BxhBBBx', user_data[:8])
+                        
+                        st_str = {0: "Idle", 1: "Testing"}.get(p_stat, f"Unknown({p_stat})")
+                        temp_c = b_temp_raw * 0.1
+                        imu_str = "Normal" if imu_st == 0 else "Fault"
+                        gps_str = "Normal" if gps_st == 0 else "Fault"
+                        
+                        status_tag += f" [St:{st_str} T:{temp_c:.1f}C IMU:{imu_str} GPS:{gps_str} Trk:{trk_st}]"
+                    except Exception as e:
+                        status_tag += f" [Decode Err: {e}]"
+                else:
+                    status_tag += f" [Warn: Short Len {len(user_data)}]"
             elif svc == SVC_TEST:
                 if sub == MSG_REPORT_END: msg_name = "TEST END REPORT"
-                elif sub == MSG_REQ_DATA: msg_name = "TEST DATA REPLY"
+                elif sub == MSG_REQ_DATA:
+                    msg_name = "TEST DATA REPLY"
+                    # TestData_t Parsing (Total 100 bytes)
+                    # Use >= 100 check to ignore extra CRC bytes if any
+                    if len(user_data) >= 100:
+                        try:
+                            # Format: < II dd ffff B3x fff fff fff 5I
+                            (gpsWeek, gpsTime, lat, lon, alt, vN, vE, vU, 
+                             trkSt, 
+                             gX, gY, gZ, 
+                             aX, aY, aZ, 
+                             roll, pitch, yaw, 
+                             r1, r2, r3, r4, r5) = struct.unpack('<IIddffffB3xfffffffff5I', user_data[:100])
+                             
+                            status_tag += (f" [GPS:{gpsWeek}/{gpsTime} Pos:{lat:.6f},{lon:.6f} Alt:{alt:.1f}]"
+                                           f" [Vel:{vN:.1f},{vE:.1f},{vU:.1f} Trk:{trkSt}]"
+                                           f" [Gyro:{gX:.2f},{gY:.2f},{gZ:.2f} Acc:{aX:.2f},{aY:.2f},{aZ:.2f}]"
+                                           f" [Att:{roll:.1f},{pitch:.1f},{yaw:.1f}]")
+                        except Exception as e:
+                            status_tag += f" [Decode Err: {e}]"
+                    else:
+                        status_tag += f" [Warn: Short Len {len(user_data)}]"
+
                 elif sub >= 10 and sub <= 127: msg_name = f"TEST DATA (Sub={sub})"
                 elif sub in [MSG_START_TEST, MSG_STOP_TEST, MSG_SET_PARAM, MSG_SEND_TPVAW]:
                     if user_data_len == 4:
@@ -602,6 +645,16 @@ class App:
             self.root.after(0, self.log, f"RX [Err: Parse Fail] {str(e)}", "pdhs")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+    try:
+        print("[DEBUG] Starting PDHS Application...")
+        root = tk.Tk()
+        print("[DEBUG] Tkinter root initialized.")
+        app = App(root)
+        print("[DEBUG] App initialized. Entering mainloop...")
+        root.mainloop()
+        print("[DEBUG] Mainloop exited normally.")
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] Application Crashed: {e}")
+        traceback.print_exc()
+        print("\nPress Enter to close window...")
+        input()
