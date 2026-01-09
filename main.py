@@ -538,9 +538,9 @@ class App:
         recv_crc_bytes = frame[-4:]
         recv_crc = struct.unpack('>I', recv_crc_bytes)[0]
         
-        # Calculate with Payload Only (Exclude Header 4 bytes)
-        # IGNU 펌웨어와 호환성 확보를 위해 Header 제외하고 Payload만 계산함
-        calc_crc = CRC32C.calc(packet_content[4:])
+        # Calculate CSP CRC32C (Header + Payload)
+        # Updated to match IGNU Firmware behavior: Header included
+        calc_crc = CRC32C.calc(packet_content)
         
         if calc_crc != recv_crc:
              self.root.after(0, self.log, f"RX [Err: CRC32C Fail] Calc:{calc_crc:08X} Recv:{recv_crc:08X}", "pdhs")
