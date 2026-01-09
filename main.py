@@ -200,6 +200,13 @@ class SerialManager:
             return True, "Sent"
         except Exception as e: return False, str(e)
 
+    def send_bytes_raw(self, raw_data):
+        if not self.is_connected: return False, "Not connected"
+        try:
+            with self.lock: self.serial.write(raw_data)
+            return True, "Sent Raw"
+        except Exception as e: return False, str(e)
+
     def read_frames(self):
         frames = []
         raw_data = b''
@@ -262,13 +269,14 @@ class PacketBuilder:
         
         csp_header = PacketBuilder.create_csp_header(PRIORITY, SOURCE_ADDRESS, DEST_ADDRESS, SOURCE_PORT, DEST_PORT)
         
-        # Calculate CSP CRC32C (Header + Body)
-        # Using CRC-32/ISCSI (Castagnoli) as per ICD R06.6 Table 12
-        full_csp_packet_no_crc32 = csp_header + csp_body
-        crc32_val = CRC32C.calc(full_csp_packet_no_crc32)
+        # Calculate CSP CRC32C (Payload Only)
+        # Updated to match IGNU Firmware behavior: Header excluded from CRC calculation
+        # Payload = CCSDS Packet (with CRC16)
+        crc32_val = CRC32C.calc(csp_body)
         crc32_bytes = struct.pack('>I', crc32_val)
         
-        return full_csp_packet_no_crc32 + crc32_bytes
+        # CSP Packet = Header + Payload + CRC32
+        return csp_header + csp_body + crc32_bytes
 
     @staticmethod
     def create_tpvaw_data():
@@ -326,6 +334,7 @@ class App:
         ttk.Button(f1, text="Start Test (SVC 1,1)", command=self.send_start_test).pack(fill="x", pady=2)
         ttk.Button(f1, text="Stop Test (SVC 1,2)", command=self.send_stop_test).pack(fill="x", pady=2)
         ttk.Button(f1, text="Set Test Param (SVC 1,4)", command=self.send_set_param).pack(fill="x", pady=2)
+        ttk.Button(f1, text="Send ICD Sample (Raw)", command=self.send_icd_sample).pack(fill="x", pady=2)
 
         # Col 2: Navigation
         f2 = ttk.LabelFrame(cmd_main_frame, text="Navigation", padding=5)
@@ -376,6 +385,18 @@ class App:
     def send_set_param(self):
         # User Data: Params. Sending empty or dummy
         self.send_cmd(SVC_TEST, MSG_SET_PARAM, "SET_PARAM")
+
+    def send_icd_sample(self):
+        # Raw Hex from ICD
+        hex_str = "c0 00 4c d2 b4 00 1d 00 db dc 00 00 09 14 01 02 3b 01 00 00 00 20 52 ba 37 46 37 c0"
+        try:
+            raw_data = bytes.fromhex(hex_str.replace(" ", ""))
+            if self.serial_mgr.send_bytes_raw(raw_data)[0]:
+                self.log(f"TX [ICD Sample]: {hex_str.upper()}")
+            else:
+                self.log("TX Error")
+        except Exception as e:
+            self.log(f"Error parsing hex: {e}")
 
     def send_tpvaw(self):
         # User Data: SendTpvawData_t
@@ -458,15 +479,22 @@ class App:
             return
 
         # 2. CSP CRC-32C Verification
-        # Checksum is the last 4 bytes
-        packet_content = frame[:-4]
+        # Checksum covers Header + Payload (Header Included) based on RX debug result
+        # frame structure: [CSP Header(4)] [CCSDS(6) + TM(12) + Data] [CRC32(4)]
+        
+        packet_content = frame[:-4] # Header + Payload
+        # payload_only = packet_content[4:] # Skip Header (4 bytes)
+        
         recv_crc_bytes = frame[-4:]
         recv_crc = struct.unpack('>I', recv_crc_bytes)[0]
         
+        # Calculate with Header Included
         calc_crc = CRC32C.calc(packet_content)
         
         if calc_crc != recv_crc:
              self.root.after(0, self.log, f"RX [Err: CRC32C Fail] Calc:{calc_crc:08X} Recv:{recv_crc:08X}")
+             # We return here to avoid processing bad packet
+             return
              # We might return here to drop invalid packets, but for debugging let's continue or return?
              # Strictly we should return.
              return
