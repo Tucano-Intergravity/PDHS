@@ -7,7 +7,6 @@ import time
 import struct
 import binascii
 import traceback
-import zlib
 
 # --- Constants & Configuration ---
 
@@ -565,51 +564,21 @@ class App:
             self.root.after(0, self.log, f"RX [Err: Short Packet] Len: {len(frame)} (Min 26)", "pdhs")
             return
 
-        # 2. CSP CRC-32C Verification
-        # Search for valid packet start (handling leading null bytes/padding)
+        # 2. CSP CRC-32C Verification (Payload Only)
+        # ICD R06.6 Compliance: Payload Only CRC (Header excluded)
+        packet_content = frame[4:-4] 
         recv_crc_bytes = frame[-4:]
         recv_crc = struct.unpack('>I', recv_crc_bytes)[0]
         
-        valid_start_idx = -1
-        crc_mode = "None"
+        # Calculate CSP CRC32C (Payload Only)
+        calc_crc = CRC32C.calc(packet_content)
         
-        # Limit search to first 500 bytes to avoid performance hit on huge garbage
-        search_limit = min(len(frame) - 8, 500) 
-        
-        for i in range(search_limit):
-            # Candidate 1: Full Packet (Header + Body)
-            candidate_full = frame[i:-4]
-            if CRC32C.calc(candidate_full) == recv_crc:
-                valid_start_idx = i
-                crc_mode = "Full"
-                break
-                
-            # Candidate 2: Body Only (Header excluded)
-            # frame[i:i+4] is Header, frame[i+4:-4] is Body
-            if len(frame) - i >= 8: # Min length check
-                candidate_body = frame[i+4:-4]
-                if CRC32C.calc(candidate_body) == recv_crc:
-                    valid_start_idx = i
-                    crc_mode = "BodyOnly"
-                    break
-
-        if valid_start_idx != -1:
-            if valid_start_idx > 0:
-                pass # self.log(f"RX [Info] Sync Found at Offset {valid_start_idx} ({crc_mode})", "pdhs")
-            frame = frame[valid_start_idx:]
-        else:
-             # If CRC32C fails, try standard CRC32 as a fallback logging
-             calc_std = zlib.crc32(frame[:-4]) & 0xFFFFFFFF
-             hex_dump = binascii.hexlify(frame).decode().upper()
-             if len(hex_dump) > 100: hex_dump = hex_dump[:100] + "..."
-             
-             self.root.after(0, self.log, f"RX [Err: CRC Fail] Recv:{recv_crc:08X} Std:{calc_std:08X} Dump:{hex_dump}", "pdhs")
+        if calc_crc != recv_crc:
+             self.root.after(0, self.log, f"RX [Err: CRC32C Fail] Calc:{calc_crc:08X} Recv:{recv_crc:08X}", "pdhs")
              return
 
         # 3. Strip CRC & CSP Header for Parsing
         # packet_content is [CCSDS Header] + [Sec Header] + [User Data]
-        # frame is now aligned to start of CSP Header
-        packet_content = frame[4:-4]
         frame = packet_content
         
         # 4. Header Parsing
