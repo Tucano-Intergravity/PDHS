@@ -6,6 +6,7 @@ import threading
 import time
 import struct
 import binascii
+import traceback
 
 # --- Constants & Configuration ---
 
@@ -337,6 +338,12 @@ class App:
         ttk.Button(f3, text="Req Status", command=self.send_req_status).pack(side="left", padx=2)
         ttk.Button(f3, text="PING", command=self.send_ping).pack(side="left", padx=2)
 
+        # Fault Injection
+        f4 = ttk.Labelframe(cmd_frame, text="Fault Injection (Negative Test)")
+        f4.pack(fill="x", pady=2)
+        ttk.Button(f4, text="Send Bad CRC", command=self.send_bad_crc).pack(side="left", padx=2)
+        ttk.Button(f4, text="Send Invalid TC (SVC=99)", command=self.send_invalid_tc).pack(side="left", padx=2)
+
         # 3. PDHS Log
         pdhs_log_frame = ttk.LabelFrame(left_frame, text="PDHS Protocol Log", padding=5)
         pdhs_log_frame.pack(fill="both", expand=True, padx=5, pady=5)
@@ -495,6 +502,30 @@ class App:
             if self.send_bytes_raw(raw)[0]: self.log(f"TX [ICD Sample]: {hex_str.upper()}", "pdhs")
         except: pass
 
+    def send_bad_crc(self):
+        # Create a valid packet first (e.g. PING)
+        packet = PacketBuilder.create_command(self.seq_count, SVC_CONN, MSG_PING_REQ, b'BAD_CRC')
+        self.seq_count = (self.seq_count + 1) % 16384
+        
+        # Corrupt the last byte (CRC is at the end)
+        bad_packet = bytearray(packet)
+        bad_packet[-1] ^= 0xFF # Invert last byte
+        
+        if self.serial_pdhs.send_packet(bad_packet)[0]:
+            self.log(f"TX [BAD CRC]: {binascii.hexlify(bad_packet).decode().upper()}", "pdhs")
+        else:
+            self.log("TX Error", "pdhs")
+
+    def send_invalid_tc(self):
+        # Send undefined Service/Subtype (SVC=99, MSG=99)
+        packet = PacketBuilder.create_command(self.seq_count, 99, 99, b'INVALID_TC')
+        self.seq_count = (self.seq_count + 1) % 16384
+        
+        if self.serial_pdhs.send_packet(packet)[0]:
+            self.log(f"TX [INV TC]: {binascii.hexlify(packet).decode().upper()}", "pdhs")
+        else:
+            self.log("TX Error", "pdhs")
+
     # --- Listener Threads ---
     def listen_pdhs(self):
         while not self.stop_pdhs_thread and self.serial_pdhs.is_connected:
@@ -565,10 +596,54 @@ class App:
             user_data_len = len(user_data)
 
             if svc == SVC_CONN and sub == MSG_PING_REP: msg_name = "PONG (Ping Reply)"
-            elif svc == SVC_STATUS and sub == MSG_REP_STATUS: msg_name = "STATUS REPLY"
+            elif svc == SVC_STATUS and sub == MSG_REP_STATUS:
+                msg_name = "STATUS REPLY"
+                
+                # 데이터가 8바이트 이상이면 구조체(8바이트)만 사용하여 디코딩 (뒤에 붙은 CRC 2바이트 등은 무시)
+                if len(user_data) >= 8:
+                    try:
+                        # PayloadStatus_t Parsing (First 8 bytes only)
+                        # UInt8(Status), UInt8(Res), SInt16(Temp), UInt8(IMU), UInt8(GPS), UInt8(Trk), UInt8(Res)
+                        # unpack format '<BxhBBBx' consumes 8 bytes but returns 5 values (x is ignored)
+                        p_stat, b_temp_raw, imu_st, gps_st, trk_st = struct.unpack('<BxhBBBx', user_data[:8])
+                        
+                        st_str = {0: "Idle", 1: "Testing"}.get(p_stat, f"Unknown({p_stat})")
+                        temp_c = b_temp_raw * 0.1
+                        imu_str = "Normal" if imu_st == 0 else "Fault"
+                        gps_str = "Normal" if gps_st == 0 else "Fault"
+                        
+                        status_tag += f" [St:{st_str} T:{temp_c:.1f}C IMU:{imu_str} GPS:{gps_str} Trk:{trk_st}]"
+                    except Exception as e:
+                        status_tag += f" [Decode Err: {e}]"
+                else:
+                    status_tag += f" [Warn: Short Len {len(user_data)}]"
+
             elif svc == SVC_TEST:
                 if sub == MSG_REPORT_END: msg_name = "TEST END REPORT"
-                elif sub == MSG_REQ_DATA: msg_name = "TEST DATA REPLY"
+                elif sub == MSG_REQ_DATA:
+                    msg_name = "TEST DATA REPLY"
+                    # TestData_t Parsing (Total 100 bytes)
+                    # Use >= 100 check to ignore extra CRC bytes if any
+                    if len(user_data) >= 100:
+                        try:
+                            # Format: < II dd ffff BBBx fff fff fff 5I
+                            # Modified Status: mode(1), error(1), NrSV(1), align(1)
+                            (gpsWeek, gpsTime, lat, lon, alt, vN, vE, vU, 
+                             mode, error, nrSv, 
+                             gX, gY, gZ, 
+                             aX, aY, aZ, 
+                             roll, pitch, yaw, 
+                             r1, r2, r3, r4, r5) = struct.unpack('<IIddffffBBBxfffffffff5I', user_data[:100])
+                             
+                            status_tag += (f" [GPS:{gpsWeek}/{gpsTime} Pos:{lat:.6f},{lon:.6f} Alt:{alt:.1f}]"
+                                           f" [Vel:{vN:.1f},{vE:.1f},{vU:.1f} Mode:{mode} Err:{error} SV:{nrSv}]"
+                                           f" [Gyro:{gX:.2f},{gY:.2f},{gZ:.2f} Acc:{aX:.2f},{aY:.2f},{aZ:.2f}]"
+                                           f" [Att:{roll:.1f},{pitch:.1f},{yaw:.1f}]")
+                        except Exception as e:
+                            status_tag += f" [Decode Err: {e}]"
+                    else:
+                        status_tag += f" [Warn: Short Len {len(user_data)}]"
+
                 elif sub >= 10 and sub <= 127: msg_name = f"TEST DATA (Sub={sub})"
                 elif sub in [MSG_START_TEST, MSG_STOP_TEST, MSG_SET_PARAM, MSG_SEND_TPVAW]:
                     if user_data_len == 4:
@@ -602,6 +677,16 @@ class App:
             self.root.after(0, self.log, f"RX [Err: Parse Fail] {str(e)}", "pdhs")
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root)
-    root.mainloop()
+    try:
+        print("[DEBUG] Starting PDHS Application...")
+        root = tk.Tk()
+        print("[DEBUG] Tkinter root initialized.")
+        app = App(root)
+        print("[DEBUG] App initialized. Entering mainloop...")
+        root.mainloop()
+        print("[DEBUG] Mainloop exited normally.")
+    except Exception as e:
+        print(f"\n[CRITICAL ERROR] Application Crashed: {e}")
+        traceback.print_exc()
+        print("\nPress Enter to close window...")
+        input()
