@@ -8,6 +8,7 @@ import struct
 import binascii
 import traceback
 import zlib
+import math
 
 # --- Constants & Configuration ---
 
@@ -254,12 +255,30 @@ class PacketBuilder:
         return csp_header + csp_body + crc32_bytes
 
     @staticmethod
-    def create_tpvaw_data():
+    def create_tpvaw_data(roll=0.0, pitch=0.0, yaw=0.0):
         t = time.time()
-        # 108 Bytes (864 bits)
-        return struct.pack('<ddddddddiiiiffffiii', 
+        
+        # Euler to Quaternion (XYZ convention)
+        # Roll, Pitch, Yaw in degrees
+        cy = math.cos(math.radians(yaw) * 0.5)
+        sy = math.sin(math.radians(yaw) * 0.5)
+        cp = math.cos(math.radians(pitch) * 0.5)
+        sp = math.sin(math.radians(pitch) * 0.5)
+        cr = math.cos(math.radians(roll) * 0.5)
+        sr = math.sin(math.radians(roll) * 0.5)
+
+        w = cr * cp * cy + sr * sp * sy
+        x = sr * cp * cy - cr * sp * sy
+        y = cr * sp * cy + sr * cp * sy
+        z = cr * cp * sy - sr * sp * cy
+
+        # 108 Bytes structure
+        # Assuming 4f corresponds to qx, qy, qz, qw based on previous 0,0,0,1 value (Identity)
+        return struct.pack('<8d4i4f3i', 
                            t, t, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                           0, 0, 0, 1, 0.0, 0.0, 0.0, 1.0, 0, 0, 0)
+                           0, 0, 0, 1, 
+                           x, y, z, w, # Quaternion (Q_BODY_WRT_ECI)
+                           0, 0, 0)
 
     @staticmethod
     def create_req_data(seq_num):
@@ -324,9 +343,25 @@ class App:
         ttk.Button(f1, text="Send ICD Sample (Raw)", command=self.send_icd_sample).pack(side="left", padx=2)
 
         # Navigation
-        f2 = ttk.Labelframe(cmd_frame, text="Navigation")
+        f2 = ttk.Labelframe(cmd_frame, text="Navigation (TPVAW)")
         f2.pack(fill="x", pady=2)
-        ttk.Button(f2, text="Send TPVAW (SVC 1,5)", command=self.send_tpvaw).pack(side="left", padx=2)
+        
+        ttk.Label(f2, text="R:").pack(side="left")
+        self.ent_roll = ttk.Entry(f2, width=5)
+        self.ent_roll.insert(0, "0.0")
+        self.ent_roll.pack(side="left")
+        
+        ttk.Label(f2, text="P:").pack(side="left")
+        self.ent_pitch = ttk.Entry(f2, width=5)
+        self.ent_pitch.insert(0, "0.0")
+        self.ent_pitch.pack(side="left")
+        
+        ttk.Label(f2, text="Y:").pack(side="left")
+        self.ent_yaw = ttk.Entry(f2, width=5)
+        self.ent_yaw.insert(0, "0.0")
+        self.ent_yaw.pack(side="left")
+
+        ttk.Button(f2, text="Send TPVAW", command=self.send_tpvaw).pack(side="left", padx=5)
         
         # Data & Status
         f3 = ttk.Labelframe(cmd_frame, text="Data & Status")
@@ -487,8 +522,15 @@ class App:
     def send_stop_test(self): self.send_cmd(SVC_TEST, MSG_STOP_TEST, "STOP_TEST")
     def send_set_param(self): self.send_cmd(SVC_TEST, MSG_SET_PARAM, "SET_PARAM")
     def send_tpvaw(self):
-        data = PacketBuilder.create_tpvaw_data()
-        self.send_cmd(SVC_TEST, MSG_SEND_TPVAW, "SEND_TPVAW", data)
+        try:
+            r = float(self.ent_roll.get())
+            p = float(self.ent_pitch.get())
+            y = float(self.ent_yaw.get())
+        except:
+            r, p, y = 0.0, 0.0, 0.0
+            
+        data = PacketBuilder.create_tpvaw_data(r, p, y)
+        self.send_cmd(SVC_TEST, MSG_SEND_TPVAW, f"SEND_TPVAW(R={r},P={p},Y={y})", data)
     def send_req_data(self):
         try: seq = int(self.seq_entry.get())
         except: return
@@ -633,13 +675,13 @@ class App:
             elif svc == SVC_STATUS and sub == MSG_REP_STATUS:
                 msg_name = "STATUS REPLY"
                 
-                # 데이터가 8바이트 이상이면 구조체(8바이트)만 사용하여 디코딩 (뒤에 붙은 CRC 2바이트 등은 무시)
-                if len(user_data) >= 8:
+                # 데이터가 6바이트 이상이면 구조체(6바이트, Packed)만 사용하여 디코딩
+                if len(user_data) >= 6:
                     try:
-                        # PayloadStatus_t Parsing (First 8 bytes only)
-                        # UInt8(Status), UInt8(Res), SInt16(Temp), UInt8(IMU), UInt8(GPS), UInt8(Trk), UInt8(Res)
-                        # unpack format '<BxhBBBx' consumes 8 bytes but returns 5 values (x is ignored)
-                        p_stat, b_temp_raw, imu_st, gps_st, trk_st = struct.unpack('<BxhBBBx', user_data[:8])
+                        # PayloadStatus_t Parsing (Packed: 6 bytes)
+                        # UInt8(Status), SInt16(Temp), UInt8(IMU), UInt8(GPS), UInt8(Trk)
+                        # unpack format '<BhBBB' consumes 6 bytes
+                        p_stat, b_temp_raw, imu_st, gps_st, trk_st = struct.unpack('<BhBBB', user_data[:6])
                         
                         st_str = {0: "Idle", 1: "Testing"}.get(p_stat, f"Unknown({p_stat})")
                         temp_c = b_temp_raw * 0.1
