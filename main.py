@@ -247,12 +247,13 @@ class PacketBuilder:
         crc_val = PacketBuilder.CRC16.calc(packet_no_crc)
         crc_bytes = struct.pack('>H', crc_val)
         
-        csp_body = packet_no_crc + crc_bytes
+        csp_body = packet_no_crc + crc_bytes  # CCSDS packet (Header + Payload + CRC-16)
         
         csp_header = PacketBuilder.create_csp_header(PRIORITY, SOURCE_ADDRESS, DEST_ADDRESS, SOURCE_PORT, DEST_PORT)
         
-        # Calculate CSP CRC32C (Payload Only)
-        # Updated to match IGNU Firmware behavior: Header excluded from CRC calculation
+        # Calculate CSP CRC32C (Payload Only - Header excluded)
+        # Match TMTC.c CspSend: Crc32Check(&ucRawPkt[CSP_HEADER_SIZE], uiLen)
+        # csp_body is the payload (CCSDS packet), Header will be added separately
         crc32_val = CRC32C.calc(csp_body)
         crc32_bytes = struct.pack('>I', crc32_val)
         
@@ -667,44 +668,44 @@ class App:
             return
 
         # 2. CSP CRC-32C Verification
-        # Search for valid packet start (handling leading null bytes/padding)
+        # Match TMTC.c CspReceive: Calculate CRC over Payload Only (Header excluded)
+        # TMTC.c: uiPayloadLen = siLen - CSP_CRC32_SIZE;
+        #         uiCalcCrc = Crc32Check(&pPacket[CSP_HEADER_SIZE], uiPayloadLen - CSP_HEADER_SIZE);
+        # This means: CRC is calculated over [Header(4) + Payload] excluding Header, i.e., Payload only
         recv_crc_bytes = frame[-4:]
         recv_crc = struct.unpack('>I', recv_crc_bytes)[0]
         
         valid_start_idx = -1
-        crc_mode = "None"
         
         # Limit search to first 500 bytes to avoid performance hit on huge garbage
         search_limit = min(len(frame) - 8, 500) 
         
         for i in range(search_limit):
-            # Candidate 1: Full Packet (Header + Body)
-            candidate_full = frame[i:-4]
-            if CRC32C.calc(candidate_full) == recv_crc:
-                valid_start_idx = i
-                crc_mode = "Full"
-                break
-                
-            # Candidate 2: Body Only (Header excluded)
-            # frame[i:i+4] is Header, frame[i+4:-4] is Body
-            if len(frame) - i >= 8: # Min length check
-                candidate_body = frame[i+4:-4]
-                if CRC32C.calc(candidate_body) == recv_crc:
-                    valid_start_idx = i
-                    crc_mode = "BodyOnly"
-                    break
+            # Check if this position has a valid CSP packet
+            # Payload = frame[i+4:-4] (skip Header(4) and CRC(4))
+            if len(frame) - i >= 8:  # Min length: Header(4) + Payload(>=0) + CRC(4)
+                candidate_payload = frame[i+4:-4]
+                if len(candidate_payload) > 0:  # Payload must exist
+                    calc_crc = CRC32C.calc(candidate_payload)
+                    if calc_crc == recv_crc:
+                        valid_start_idx = i
+                        break
 
         if valid_start_idx != -1:
             if valid_start_idx > 0:
-                pass # self.log(f"RX [Info] Sync Found at Offset {valid_start_idx} ({crc_mode})", "pdhs")
+                pass # self.log(f"RX [Info] Sync Found at Offset {valid_start_idx}", "pdhs")
             frame = frame[valid_start_idx:]
         else:
-             # If CRC32C fails, try standard CRC32 as a fallback logging
-             calc_std = zlib.crc32(frame[:-4]) & 0xFFFFFFFF
+             # If CRC32C fails, try to calculate expected CRC for logging
+             if len(frame) >= 8:
+                 candidate_payload = frame[4:-4]
+                 calc_crc = CRC32C.calc(candidate_payload) if len(candidate_payload) > 0 else 0
+             else:
+                 calc_crc = 0
              hex_dump = binascii.hexlify(frame).decode().upper()
              if len(hex_dump) > 100: hex_dump = hex_dump[:100] + "..."
              
-             self.root.after(0, self.log, f"RX [Err: CRC Fail] Recv:{recv_crc:08X} Std:{calc_std:08X} Dump:{hex_dump}", "pdhs")
+             self.root.after(0, self.log, f"RX [Err: CRC Fail] Recv:{recv_crc:08X} Calc:{calc_crc:08X} Dump:{hex_dump}", "pdhs")
              return
 
         # 3. Parse CSP Header before stripping
@@ -728,26 +729,48 @@ class App:
             "pdhs")
         
         # 4. Strip CRC & CSP Header for Parsing
-        # packet_content is [CCSDS Header] + [Sec Header] + [User Data]
+        # packet_content is [CCSDS Header] + [Sec Header] + [User Data] + [CRC-16]
         packet_content = frame[4:-4]
         frame = packet_content
         
         # 5. Header Parsing
         # CCSDS Header: 6 bytes
         ccsds_raw = frame[0:6]
-        # Secondary Header: 12 bytes
-        tm_sec_raw = frame[6:18]
+        if len(frame) < 10:
+            self.root.after(0, self.log, f"RX [Err: Too Short] Len: {len(frame)}", "pdhs")
+            return
         
         try:
             ccsds_hdr = struct.unpack('>HHH', ccsds_raw)
             apid = ccsds_hdr[0] & 0x7FF
+            packet_type = (ccsds_hdr[0] >> 13) & 0x01  # Type bit: 0=TM, 1=TC
             
-            svc, sub, src, t_sec, t_sub, flags, spare = struct.unpack('>BBHIHBB', tm_sec_raw)
+            # Determine secondary header size: TC=4 bytes, TM=12 bytes
+            # Match TMTC.c: TC uses CCSDS_TC_SEC_HEADER_SIZE (4), TM uses CCSDS_TM_SEC_HEADER_SIZE (12)
+            if packet_type == 1:  # TC (Telecommand)
+                sec_header_size = 4
+                if len(frame) < 6 + sec_header_size + 2:  # Min: Pri(6) + Sec(4) + CRC(2)
+                    self.root.after(0, self.log, f"RX [Err: TC Too Short] Len: {len(frame)}", "pdhs")
+                    return
+                tc_sec_raw = frame[6:10]
+                svc, sub, src = struct.unpack('>BBH', tc_sec_raw)
+                # Calculate User Data Length: Total - Primary Header(6) - Secondary Header(4) - CRC-16(2)
+                # Match TMTC.c: uiUserDataLen = uiLen - (CCSDS_PRI_HEADER_SIZE + CCSDS_TC_SEC_HEADER_SIZE + 2)
+                user_data_len = len(frame) - (6 + 4 + 2)  # Primary(6) + Secondary(4) + CRC-16(2)
+                user_data = frame[10:10+user_data_len] if user_data_len > 0 else b''
+            else:  # TM (Telemetry)
+                sec_header_size = 12
+                if len(frame) < 6 + sec_header_size + 2:  # Min: Pri(6) + Sec(12) + CRC(2)
+                    self.root.after(0, self.log, f"RX [Err: TM Too Short] Len: {len(frame)}", "pdhs")
+                    return
+                tm_sec_raw = frame[6:18]
+                svc, sub, src, t_sec, t_sub, flags, spare = struct.unpack('>BBHIHBB', tm_sec_raw)
+                # Calculate User Data Length: Total - Primary Header(6) - Secondary Header(12) - CRC-16(2)
+                user_data_len = len(frame) - (6 + 12 + 2)  # Primary(6) + Secondary(12) + CRC-16(2)
+                user_data = frame[18:18+user_data_len] if user_data_len > 0 else b''
             
             msg_name = "Unknown"
             status_tag = ""
-            user_data = frame[18:] 
-            user_data_len = len(user_data)
 
             if svc == SVC_CONN and sub == MSG_PING_REP: msg_name = "PONG (Ping Reply)"
             elif svc == SVC_STATUS and sub == MSG_REP_STATUS:
@@ -817,7 +840,8 @@ class App:
                         ack_str = "ACK (Success)" if ack == 0xFF else f"NACK (Fail)"
                         status_tag += f" [{ack_str} Code:0x{code:06X}]"
             
-            if apid != 0x550: status_tag += f" [Warn: APID {apid:03X}]"
+            # PDHS uses APID 0x023B, IGNU sends TM with 0x023B - both are valid
+            if apid != 0x550 and apid != 0x23B: status_tag += f" [Warn: APID {apid:03X}]"
             
             # Validate CSP header addresses
             # Expected: src=19 (IGNU), dst=6 (PDHS) when receiving
